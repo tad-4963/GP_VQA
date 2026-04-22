@@ -1,0 +1,24 @@
+# Bỏ qua môi trường ảo
+venv/
+.venv/
+env/
+
+__pycache__/
+*.pyc
+torchxrayvision-main/
+swin_base/
+swin_base_original/
+data/
+*.csv
+*.tsv
+*.json
+*.xlsx
+
+MIMIC-CXR-main/
+*.pt
+*.pth
+*.h5
+*.onnx
+
+logs/
+runs/
