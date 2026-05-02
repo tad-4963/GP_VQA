@@ -19,7 +19,7 @@ class MedSAM_VisionEncoder(nn.Module):
         use_text_guidance=True,
         num_text_attention_heads=8,
         num_global_disease_labels=14,
-        num_entity_finding_labels=51,
+        num_entity_finding_labels=50,
         num_entity_anatomy_labels=29,
         # Deprecated alias, giữ để không vỡ code cũ khi truyền keyword cũ.
         num_entity_disease_labels=None,
@@ -571,7 +571,7 @@ class MedSAM_VisionEncoder(nn.Module):
         global_feat = self.global_proj(pooled_feat) # Shape: [B, embed_dim]
         
         # Đưa qua classifier để ra kết quả phân loại đa nhãn bệnh (Logits)
-        global_logits = self.classifier(global_feat) # Shape: [B, 11]
+        global_logits = self.classifier(global_feat) # Shape: [B, num_global_disease_labels]
 
         # Đầu ra đa nhãn entity trên cùng không gian đặc trưng global.
         entity_logits = self.entity_classifier(global_feat) # Shape: [B, num_entity_labels]

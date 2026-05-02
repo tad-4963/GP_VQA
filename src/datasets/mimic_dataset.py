@@ -5,6 +5,7 @@ import pandas as pd
 import re
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data._utils.collate import default_collate
 from torchvision import transforms
 
 class MedicalVQADataset(Dataset):
@@ -60,7 +61,7 @@ class MedicalVQADataset(Dataset):
     ):
         """
         Dataset cho Medical VQA.
-        Cấu trúc chuẩn: 11 Bệnh lý (Global Labels),
+        Cấu trúc chuẩn: 14 bệnh lý CheXpert (Global Labels),
         Disease-entities (Findings), 29 Anatomy-entities (Location).
         Mỗi entity mẫu là disease + anatomy (anatomy có thể không có).
         """
@@ -164,7 +165,7 @@ class MedicalVQADataset(Dataset):
             "pleural abnormality": "plural abnormality",
         }
 
-        # Tải 2 từ điển hoàn toàn độc lập mà FPT LLM vừa tạo ra
+        # Tải 2 từ điển 
         self.disease_map = self._load_custom_dict(norm_disease_csv, col_raw="Raw_Term", col_mapped="Mapped_Disease")
         self.anatomy_map = self._load_custom_dict(norm_anatomy_csv, col_raw="Raw_Term", col_mapped="Mapped_Anatomy")
 
@@ -195,6 +196,23 @@ class MedicalVQADataset(Dataset):
                 seen.add(term)
                 output.append(term)
         return output
+
+    def resolve_study_id(self, row):
+        """Lấy study_id khớp JSON entity, ưu tiên cột study_id nếu CSV có sẵn."""
+        if "study_id" in row.index and pd.notna(row.get("study_id")):
+            raw_study_id = str(row.get("study_id")).strip()
+            if raw_study_id.endswith(".0"):
+                raw_study_id = raw_study_id[:-2]
+            match = re.search(r"\bs?(\d+)\b", raw_study_id)
+            if match:
+                return match.group(1)
+
+        img_filename = str(row[self.fname_col]).strip()
+        img_basename = os.path.basename(img_filename)
+        match = re.search(r"\bs(\d+)\b", img_filename)
+        if match:
+            return match.group(1)
+        return re.sub(r"[^0-9]", "", img_basename)
 
     def _load_custom_dict(self, csv_path, col_raw, col_mapped):
         norm_dict = {}
@@ -300,7 +318,7 @@ class MedicalVQADataset(Dataset):
             img_filename = f"{img_filename}.jpg"
         img_basename = os.path.basename(img_filename)
 
-        study_id = re.sub(r'[^0-9]', '', img_filename)
+        study_id = self.resolve_study_id(row)
 
         # Ưu tiên layout phẳng: <img_dir>/<dicom_id>.jpg
         flat_path = os.path.join(self.img_dir, img_basename)
@@ -374,7 +392,7 @@ class MedicalVQADataset(Dataset):
 
         return {
             'image': image,
-            'global_labels': global_labels,   # Kích thước [11]
+            'global_labels': global_labels,   # Kích thước [14]
             'local_prompts': local_prompt_str,
             'entity_multihot_labels': entity_labels,          # Key rõ nghĩa cho train đa nhãn entity
             'entity_labels': entity_labels,                    # Kích thước [finding + anatomy]
@@ -385,6 +403,29 @@ class MedicalVQADataset(Dataset):
             'entity_disease_labels': finding_entity_labels,
             'study_id': study_id
         }
+
+
+def medical_vqa_collate_fn(batch):
+    """Collate batch cho MedicalVQADataset.
+
+    Tensor labels/images được stack như mặc định; metadata entity có số lượng
+    khác nhau theo ảnh nên giữ nguyên dạng list để DataLoader không crash.
+    """
+    if len(batch) == 0:
+        return {}
+
+    raw_list_keys = {"entity_items", "local_prompts", "study_id"}
+    collated = {}
+    for key in batch[0].keys():
+        values = [sample[key] for sample in batch]
+        if key in raw_list_keys:
+            collated[key] = values
+            continue
+        try:
+            collated[key] = default_collate(values)
+        except (TypeError, RuntimeError):
+            collated[key] = values
+    return collated
     
 # === ĐOẠN CODE TEST NHANH  ===
 if __name__ == "__main__":

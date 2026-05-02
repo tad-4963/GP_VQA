@@ -92,7 +92,6 @@ def train_model(
     encoder_backend: str = "transformers",
     debug_mode: bool = False,
 ):
-    import re
     import torch
     import torch.nn as nn
     import torch.optim as optim
@@ -124,7 +123,7 @@ def train_model(
             return 0.0, 0
         return float(np.mean(auc_values)), len(auc_values)
     
-    from src.datasets.mimic_dataset import MedicalVQADataset
+    from src.datasets.mimic_dataset import MedicalVQADataset, medical_vqa_collate_fn
     from src.models.vision.medsam_encoder import MedSAM_VisionEncoder
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -146,6 +145,8 @@ def train_model(
     alpha_entity = 0.5
     use_lora = bool(use_lora)
     DEBUG_MODE = bool(debug_mode)
+    if DEBUG_MODE:
+        epochs = 1
     # ============================================
 
     wandb.init(
@@ -175,9 +176,7 @@ def train_model(
     csv_file = os.environ.get("MEDSAM_CSV_FILE", "/data/dataset/mimic_all_final.csv")
     json_candidates = [
         os.environ.get("MEDSAM_JSON_FILE", "").strip(),
-        "/data/dataset/filtered_all_diseases.json",
-        "/data/dataset/filter/filtered_all_diseases.json",
-        "/data/dataset/all_diseases.json",
+        "/data/dataset//all_diseases_final.json",
     ]
     json_file = next((p for p in json_candidates if p and os.path.exists(p)), None)
     if json_file is None:
@@ -241,11 +240,13 @@ def train_model(
 
     train_loader = DataLoader(
         train_dataset, batch_size=train_bs, shuffle=True,
-        num_workers=num_workers, pin_memory=True, persistent_workers=True, drop_last=True
+        num_workers=num_workers, pin_memory=True, persistent_workers=True, drop_last=True,
+        collate_fn=medical_vqa_collate_fn,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=val_bs, shuffle=False,
-        num_workers=num_workers, pin_memory=True, persistent_workers=True
+        num_workers=num_workers, pin_memory=True, persistent_workers=True,
+        collate_fn=medical_vqa_collate_fn,
     )
     
     print("Khởi tạo MedSAM Vision Language Model...")
@@ -307,14 +308,8 @@ def train_model(
 
     num_entity_labels = len(entity_dataset.raw_finding_labels) + len(entity_dataset.raw_anatomy_labels)
     entity_pos_counts = np.zeros(num_entity_labels, dtype=np.float32)
-    for img_name in entity_rows[entity_dataset.fname_col].astype(str).tolist():
-        img_name = img_name.strip()
-        base_name = img_name.split('/')[-1]
-        match = re.search(r'\bs(\d+)\b', base_name)
-        if match:
-            row_study_id = match.group(1)
-        else:
-            row_study_id = re.sub(r'[^0-9]', '', base_name)
+    for _, entity_row in entity_rows.iterrows():
+        row_study_id = entity_dataset.resolve_study_id(entity_row)
         if row_study_id in entity_dataset.json_dict:
             _, finding_hits, anatomy_hits, _ = entity_dataset._extract_text_prompts(entity_dataset.json_dict[row_study_id])
             entity_vec = torch.cat([finding_hits, anatomy_hits], dim=0).numpy().astype(np.float32)
