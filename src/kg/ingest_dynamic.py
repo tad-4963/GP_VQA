@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import re
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from .client import Neo4jClient
@@ -67,6 +69,40 @@ def _coerce_confidence(value: Any, default: Optional[float] = None) -> Optional[
         return 1.0
     return confidence
 
+def _auto_patient_id(study_id: Any, element_id: Any) -> str:
+    key = f"{_clean_text(study_id)}:{_clean_text(element_id)}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    return f"auto_patient_{digest}"
+
+def _resolve_patient_id(row: Dict[str, Any]) -> str:
+    explicit = (
+        _optional_text(row.get("patient_id"))
+        or _optional_text(row.get("user_id"))
+        or _optional_text(row.get("subject_id"))
+    )
+    if explicit:
+        return explicit
+    return _auto_patient_id(row.get("study_id"), row.get("element_id"))
+
+def _resolve_ingested_at(row: Dict[str, Any], default_ingested_at: str) -> str:
+    value = str(row.get("ingested_at") or row.get("created_at") or default_ingested_at).strip()
+    return value or default_ingested_at
+
+def _prepare_dynamic_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    default_ingested_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    prepared: List[Dict[str, Any]] = []
+    for row in rows:
+        enriched = dict(row)
+        patient_id = _resolve_patient_id(enriched)
+        ingested_at = _resolve_ingested_at(enriched, default_ingested_at)
+        enriched["patient_id"] = patient_id
+        enriched["user_id"] = _optional_text(enriched.get("user_id")) or patient_id
+        enriched["subject_id"] = _optional_text(enriched.get("subject_id")) or patient_id
+        enriched["ingested_at"] = ingested_at
+        enriched["ingest_date"] = str(enriched.get("ingest_date") or ingested_at[:10])
+        prepared.append(enriched)
+    return prepared
+
 
 def _split_candidates(value: Any) -> List[str]:
     if value is None:
@@ -90,6 +126,8 @@ def _dynamic_payload_row(
     finding_name: Any,
     confidence: Any,
     subject_id: Any = "",
+    patient_id: Any = "",
+    user_id: Any = "",
     view: Any = "",
     location_raw: Any = "",
     level: Any = "",
@@ -102,6 +140,7 @@ def _dynamic_payload_row(
     run_id: str = "",
     bbox: Any = None,
     patch_id: Any = "",
+    ingested_at: Any = "",
 ) -> Optional[Dict[str, Any]]:
     study_id_clean = _clean_text(study_id)
     element_id_clean = _clean_text(element_id)
@@ -114,10 +153,12 @@ def _dynamic_payload_row(
     location_clean = _optional_text(location_raw)
     candidates = anatomy_candidates if anatomy_candidates is not None else _location_candidates(location_clean)
 
-    return {
+    row = {
         "study_id": study_id_clean,
         "element_id": element_id_clean,
         "subject_id": _clean_text(subject_id),
+        "patient_id": _optional_text(patient_id),
+        "user_id": _optional_text(user_id),
         "view": _clean_text(view),
         "finding_name": finding_clean,
         "location_raw": location_clean,
@@ -132,7 +173,9 @@ def _dynamic_payload_row(
         "run_id": str(run_id or ""),
         "bbox": bbox,
         "patch_id": str(patch_id or ""),
+        "ingested_at": str(ingested_at or ""),
     }
+    return _prepare_dynamic_rows([row])[0]
 
 
 def _location_candidates(location_raw: Optional[str]) -> List[str]:
@@ -338,6 +381,8 @@ def _vision_prediction_to_payload(
         study_id=row.get("study_id"),
         element_id=element_id,
         subject_id=row.get("subject_id"),
+        patient_id=row.get("patient_id"),
+        user_id=row.get("user_id"),
         view=row.get("view"),
         finding_name=finding_name,
         location_raw=location_raw,
@@ -359,13 +404,19 @@ def ingest_dynamic_entities(client: Neo4jClient, rows: List[Dict[str, Any]], bat
     if not rows:
         return 0
 
+    rows = _prepare_dynamic_rows(rows)
+
     query = """
     UNWIND $rows AS row
     MERGE (i:ImageElement {element_id: row.element_id})
     SET i.study_id = row.study_id,
         i.subject_id = row.subject_id,
+        i.patient_id = row.patient_id,
+        i.user_id = row.user_id,
         i.view = row.view,
-        i.source = row.source
+        i.source = row.source,
+        i.ingested_at = row.ingested_at,
+        i.ingest_date = row.ingest_date
 
     WITH row, i
     OPTIONAL MATCH (f_direct:Finding {canonical_name: row.finding_name})

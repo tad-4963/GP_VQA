@@ -19,6 +19,8 @@ INDEX_QUERIES = [
     "CREATE INDEX anatomy_name_idx IF NOT EXISTS FOR (a:Anatomy) ON (a.name)",
     "CREATE INDEX finding_name_idx IF NOT EXISTS FOR (f:Finding) ON (f.name)",
     "CREATE INDEX image_study_idx IF NOT EXISTS FOR (i:ImageElement) ON (i.study_id)",
+    "CREATE INDEX image_patient_idx IF NOT EXISTS FOR (i:ImageElement) ON (i.patient_id)",
+    "CREATE INDEX image_ingest_date_idx IF NOT EXISTS FOR (i:ImageElement) ON (i.ingest_date)",
     "CREATE INDEX text_study_idx IF NOT EXISTS FOR (t:TextChunk) ON (t.study_id)",
     "CREATE INDEX ontology_name_idx IF NOT EXISTS FOR (o:OntologyConcept) ON (o.name)",
 ]
