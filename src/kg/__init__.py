@@ -13,6 +13,10 @@ __all__ = [
     "retrieve_existence_context",
     "retrieve_location_context",
     "retrieve_abnormality_context",
+    "retrieve_patients_by_diseases_on_date",
+    "retrieve_patient_history",
+    "retrieve_cohort_counts",
+    "execute_routed_kg_query",
 ]
 
 
@@ -41,12 +45,32 @@ def __getattr__(name: str):
             "ingest_snomed_hierarchy": ingest_snomed_hierarchy,
             "ingest_radgraph_priors": ingest_radgraph_priors,
         }[name]
-    if name in {"retrieve_existence_context", "retrieve_location_context", "retrieve_abnormality_context"}:
-        from .queries import retrieve_abnormality_context, retrieve_existence_context, retrieve_location_context
+    if name in {
+        "retrieve_existence_context",
+        "retrieve_location_context",
+        "retrieve_abnormality_context",
+        "retrieve_patients_by_diseases_on_date",
+        "retrieve_patient_history",
+        "retrieve_cohort_counts",
+        "execute_routed_kg_query",
+    }:
+        from .queries import (
+            execute_routed_kg_query,
+            retrieve_abnormality_context,
+            retrieve_cohort_counts,
+            retrieve_existence_context,
+            retrieve_location_context,
+            retrieve_patient_history,
+            retrieve_patients_by_diseases_on_date,
+        )
 
         return {
             "retrieve_existence_context": retrieve_existence_context,
             "retrieve_location_context": retrieve_location_context,
             "retrieve_abnormality_context": retrieve_abnormality_context,
+            "retrieve_patients_by_diseases_on_date": retrieve_patients_by_diseases_on_date,
+            "retrieve_patient_history": retrieve_patient_history,
+            "retrieve_cohort_counts": retrieve_cohort_counts,
+            "execute_routed_kg_query": execute_routed_kg_query,
         }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
