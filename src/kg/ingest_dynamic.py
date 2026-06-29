@@ -433,6 +433,7 @@ def ingest_dynamic_entities(client: Neo4jClient, rows: List[Dict[str, Any]], bat
         e.level = row.level,
         e.finding_type = row.finding_type,
         e.location_raw = row.location_raw,
+        e.anatomy_candidates = row.anatomy_candidates,
         e.source = row.source,
         e.model_id = row.model_id,
         e.checkpoint_path = row.checkpoint_path,
