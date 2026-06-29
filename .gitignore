@@ -1,24 +1,65 @@
 # Bỏ qua môi trường ảo
+.env
+.env.*
+!.env.example
 venv/
 .venv/
 env/
+NOTE.md
+.codex
+.codex/
+MMed-RAG-main/
 
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+PMC-VQA-master/
 torchxrayvision-main/
 swin_base/
 swin_base_original/
+external/
 data/
+neo4j_data/
+
 *.csv
 *.tsv
 *.json
 *.xlsx
+*.RRF
 
 MIMIC-CXR-main/
 *.pt
 *.pth
+*.ckpt
+*.bin
+*.safetensors
 *.h5
 *.onnx
+*.pkl
+*.joblib
+
+# Model/checkpoint artifacts. Keep training scripts in weights/.
+weights/**
+!weights/
+!weights/*.py
 
 logs/
 runs/
+outputs/
+checkpoints/
+artifacts/
+wandb/
+mlruns/
+
+*.log
+*.tmp
+*.bak
+*.corrupt-*
+*:Zone.Identifier
+Doc/
+Localize-before-Answering-main/
+Report/*

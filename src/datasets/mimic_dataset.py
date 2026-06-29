@@ -44,6 +44,43 @@ class MedicalVQADataset(Dataset):
         "rotated",
         "cvp line",
         "linear band",
+        # Dropped after rebuilding mimic_all_final.csv: each label must have
+        # at least 5 positives in train, validate, and test.
+        "arthritic change",
+        "asymmetry",
+        "bronchiectasis",
+        "cavitation",
+        "collapsed",
+        "cyst / cystic",
+        "elevated",
+        "enlarged",
+        "engorgement",
+        "eventration",
+        "hardware",
+        "kyphosis",
+        "low lung volumes",
+        "lucency",
+        "opacification",
+        "osteopenia",
+        "osteophyte",
+        "plural abnormality",
+        "pneumomediastinum",
+        "pneumoperitoneum",
+        "prominent",
+        "scoliosis",
+        "surgical material",
+    }
+    DEFAULT_DROPPED_ANATOMY = {
+        # Dropped after rebuilding mimic_all_final.csv: each label must have
+        # at least 5 positives in train, validate, and test.
+        "cardiac silhouette",
+        "carina",
+        "cavoatrial junction",
+        "left clavicle",
+        "right atrium",
+        "superior vena cava",
+        "trachea",
+        "upper mediastinum",
     }
 
     def __init__(
@@ -55,6 +92,8 @@ class MedicalVQADataset(Dataset):
         norm_anatomy_csv=None,
         transform=None,
         split=None,
+        uncertain_policy="to_zero",
+        excluded_global_labels=None,
         fail_on_image_error=True,
         skip_on_image_error=False,
         max_image_error_logs=5,
@@ -105,6 +144,9 @@ class MedicalVQADataset(Dataset):
         self.skip_on_image_error = skip_on_image_error
         self.max_image_error_logs = max_image_error_logs
         self.image_error_count = 0
+        self.uncertain_policy = str(uncertain_policy).strip().lower()
+        if self.uncertain_policy not in {"to_zero", "to_nan", "ignore"}:
+            raise ValueError("uncertain_policy phải là một trong: 'to_zero', 'to_nan', 'ignore'")
         
         # Global disease labels: chỉ dùng schema 14 nhãn CheXpert mới.
         canonical_14 = [
@@ -118,7 +160,12 @@ class MedicalVQADataset(Dataset):
             raise ValueError(
                 "CSV không đúng schema 14 nhãn. Thiếu cột: " + ", ".join(missing_cols)
             )
-        self.disease_cols = canonical_14
+        self.full_disease_cols = canonical_14
+        excluded = {str(label).strip() for label in (excluded_global_labels or [])}
+        self.excluded_global_labels = [label for label in canonical_14 if label in excluded]
+        self.disease_cols = [label for label in canonical_14 if label not in excluded]
+        if not self.disease_cols:
+            raise ValueError("Không còn global label nào để train sau khi loại trừ excluded_global_labels.")
 
         # Label space cho thực thể bệnh (findings) và vị trí (anatomy)
         self.raw_anatomy_labels = [
@@ -127,6 +174,10 @@ class MedicalVQADataset(Dataset):
             "left mid lung zone", "left lower lung zone", "left apical zone", "left hilar structures", "left costophrenic angle",
             "left hemidiaphragm", "trachea", "spine", "right clavicle", "left clavicle", "aortic arch", "mediastinum",
             "upper mediastinum", "superior vena cava", "cardiac silhouette", "cavoatrial junction", "right atrium", "carina", "abdomen"
+        ]
+        self.raw_anatomy_labels = [
+            label for label in self.raw_anatomy_labels
+            if label not in self.DEFAULT_DROPPED_ANATOMY
         ]
         self.raw_finding_labels = [
             "consolidation", "pleural effusion", "pneumothorax", "atelectasis", "pulmonary edema", "cardiomegaly", "pneumonia",
@@ -376,8 +427,23 @@ class MedicalVQADataset(Dataset):
                 image = torch.zeros((3, 1008, 1008), dtype=torch.float32)
 
         # Trích xuất vector global labels theo schema 14 nhãn
-        labels_values = pd.to_numeric(row[self.disease_cols], errors='coerce').fillna(0.0).values.astype('float32')
+        label_series = pd.to_numeric(row[self.disease_cols], errors='coerce')
+        if self.uncertain_policy == "to_zero":
+            label_series = label_series.fillna(0.0).replace(-1.0, 0.0)
+            label_mask = pd.Series(1.0, index=self.disease_cols, dtype="float32")
+        elif self.uncertain_policy == "to_nan":
+            label_series = label_series.replace(-1.0, pd.NA)
+            label_mask = label_series.notna().astype("float32")
+            label_series = label_series.fillna(0.0)
+        else:
+            valid = label_series.notna() & (label_series != -1.0)
+            label_mask = valid.astype("float32")
+            label_series = label_series.where(valid, 0.0).fillna(0.0)
+
+        labels_values = label_series.values.astype('float32')
+        mask_values = label_mask.values.astype('float32')
         global_labels = torch.tensor(labels_values, dtype=torch.float32)
+        global_label_mask = torch.tensor(mask_values, dtype=torch.float32)
 
         # Trích xuất Local Prompts (Findings & Anatomy)
         local_prompt_str = "normal chest anatomy"
@@ -393,6 +459,7 @@ class MedicalVQADataset(Dataset):
         return {
             'image': image,
             'global_labels': global_labels,   # Kích thước [14]
+            'global_label_mask': global_label_mask,
             'local_prompts': local_prompt_str,
             'entity_multihot_labels': entity_labels,          # Key rõ nghĩa cho train đa nhãn entity
             'entity_labels': entity_labels,                    # Kích thước [finding + anatomy]

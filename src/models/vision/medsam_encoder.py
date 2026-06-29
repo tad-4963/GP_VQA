@@ -5,7 +5,12 @@ from collections import Counter
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer, Sam3Model
-from peft import LoraConfig, get_peft_model
+
+try:
+    from peft import LoraConfig, get_peft_model
+except ModuleNotFoundError:
+    LoraConfig = None
+    get_peft_model = None
 
 class MedSAM_VisionEncoder(nn.Module):
     def __init__(
@@ -19,10 +24,16 @@ class MedSAM_VisionEncoder(nn.Module):
         use_text_guidance=True,
         num_text_attention_heads=8,
         num_global_disease_labels=14,
-        num_entity_finding_labels=50,
-        num_entity_anatomy_labels=29,
+        num_entity_finding_labels=27,
+        num_entity_anatomy_labels=21,
         # Deprecated alias, giữ để không vỡ code cũ khi truyền keyword cũ.
         num_entity_disease_labels=None,
+        use_local_entity_head=False,
+        local_entity_merge="all",
+        entity_pooling="global",
+        global_pooling="mean",
+        global_head="linear",
+        global_head_dropout=0.1,
         require_attention_lora=False,
         encoder_backend="transformers",
         medsam3_repo_path="/root/external/MedSAM3",
@@ -37,6 +48,20 @@ class MedSAM_VisionEncoder(nn.Module):
         self.encoder_backend = str(encoder_backend).strip().lower()
         self.medsam3_repo_path = medsam3_repo_path
         self.num_global_disease_labels = num_global_disease_labels
+        self.use_local_entity_head = bool(use_local_entity_head)
+        self.local_entity_merge = str(local_entity_merge or "all").strip().lower()
+        if self.local_entity_merge not in {"all", "anatomy"}:
+            raise ValueError("local_entity_merge must be one of: 'all', 'anatomy'")
+        self.entity_pooling = str(entity_pooling or "global").strip().lower()
+        if self.entity_pooling not in {"global", "meanmax"}:
+            raise ValueError("entity_pooling must be one of: 'global', 'meanmax'")
+        self.global_pooling = str(global_pooling or "mean").strip().lower()
+        if self.global_pooling not in {"mean", "max", "meanmax", "attn", "attn_meanmax"}:
+            raise ValueError("global_pooling must be one of: 'mean', 'max', 'meanmax', 'attn', 'attn_meanmax'")
+        self.global_head_type = str(global_head or "linear").strip().lower()
+        if self.global_head_type not in {"linear", "mlp"}:
+            raise ValueError("global_head must be one of: 'linear', 'mlp'")
+        self.global_head_dropout = float(global_head_dropout)
 
         if num_entity_disease_labels is not None:
             num_entity_finding_labels = num_entity_disease_labels
@@ -88,6 +113,23 @@ class MedSAM_VisionEncoder(nn.Module):
         # 2. CÁC LỚP PROJECTOR
         # ==========================================
         sam_hidden_dim = 1024 # Giữ cố định như cấu hình cũ để tương thích checkpoint hiện tại
+
+        self.global_attention_pool = None
+        if self.global_pooling in {"attn", "attn_meanmax"}:
+            attn_hidden_dim = max(128, sam_hidden_dim // 4)
+            self.global_attention_pool = nn.Sequential(
+                nn.LayerNorm(sam_hidden_dim),
+                nn.Linear(sam_hidden_dim, attn_hidden_dim),
+                nn.Tanh(),
+                nn.Linear(attn_hidden_dim, 1),
+            )
+
+        self.global_pool_logits = None
+        if self.global_pooling == "meanmax":
+            self.global_pool_logits = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
+        elif self.global_pooling == "attn_meanmax":
+            # Start close to historical mean pooling so old checkpoints remain useful.
+            self.global_pool_logits = nn.Parameter(torch.tensor([2.0, -1.0, -1.0], dtype=torch.float32))
         
         self.global_proj = nn.Sequential(
             # Bỏ AdaptiveAvgPool2d và Flatten đi
@@ -102,10 +144,33 @@ class MedSAM_VisionEncoder(nn.Module):
         )
 
         # Head đa nhãn bệnh toàn cục (schema 14 nhãn).
+        self.global_head = None
+        if self.global_head_type == "mlp":
+            self.global_head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, embed_dim * 2),
+                nn.GELU(),
+                nn.Dropout(p=self.global_head_dropout),
+                nn.Linear(embed_dim * 2, embed_dim),
+                nn.Dropout(p=self.global_head_dropout),
+            )
+            # Residual head starts as identity: x + 0.
+            nn.init.zeros_(self.global_head[4].weight)
+            nn.init.zeros_(self.global_head[4].bias)
         self.classifier = nn.Linear(embed_dim, self.num_global_disease_labels)
 
         # Head đa nhãn entity: [finding entities | anatomy entities].
+        self.entity_pool_proj = None
+        if self.entity_pooling == "meanmax":
+            self.entity_pool_proj = nn.Sequential(
+                nn.Linear(sam_hidden_dim * 2, embed_dim),
+                nn.LayerNorm(embed_dim),
+                nn.ReLU()
+            )
         self.entity_classifier = nn.Linear(embed_dim, self.num_entity_labels)
+        self.entity_patch_classifier = None
+        if self.use_local_entity_head:
+            self.entity_patch_classifier = nn.Linear(embed_dim, self.num_entity_labels)
 
         # 3. Nhánh Text-Guided
         self.tokenizer = None
@@ -114,6 +179,28 @@ class MedSAM_VisionEncoder(nn.Module):
         self.text_to_patch_attn = None
         if self.use_text_guidance:
             self._init_text_modules()
+
+    def _pool_global_features(self, image_embeddings):
+        mean_feat = image_embeddings.mean(dim=1)
+        if self.global_pooling == "mean":
+            return mean_feat
+
+        max_feat = image_embeddings.max(dim=1).values
+        if self.global_pooling == "max":
+            return max_feat
+
+        if self.global_pooling == "meanmax":
+            weights = torch.softmax(self.global_pool_logits.to(dtype=image_embeddings.dtype), dim=0)
+            return weights[0] * mean_feat + weights[1] * max_feat
+
+        attn_scores = self.global_attention_pool(image_embeddings).squeeze(-1)
+        attn_weights = torch.softmax(attn_scores.float(), dim=1).to(dtype=image_embeddings.dtype)
+        attn_feat = (image_embeddings * attn_weights.unsqueeze(-1)).sum(dim=1)
+        if self.global_pooling == "attn":
+            return attn_feat
+
+        weights = torch.softmax(self.global_pool_logits.to(dtype=image_embeddings.dtype), dim=0)
+        return weights[0] * mean_feat + weights[1] * max_feat + weights[2] * attn_feat
 
     def _load_medsam3_trunk(self, sam3_base_checkpoint):
         repo_path = os.path.abspath(self.medsam3_repo_path)
@@ -321,6 +408,12 @@ class MedSAM_VisionEncoder(nn.Module):
     # HÀM BỔ TRỢ: SMART MATCHING LORA ALGORITHM
     # ==========================================
     def _apply_smart_matching_lora(self, base_encoder, pt_path):
+        if LoraConfig is None or get_peft_model is None:
+            raise RuntimeError(
+                "peft is required to load transformer LoRA weights. "
+                "Install peft or pass lora_weights_path=None to use the base encoder/checkpoint state_dict."
+            )
+
         if not os.path.exists(pt_path):
             print(f"CẢNH BÁO: Không tìm thấy {pt_path}. Sẽ sử dụng Base weights.")
             return base_encoder
@@ -356,10 +449,13 @@ class MedSAM_VisionEncoder(nn.Module):
             return base_encoder
 
         # 2. XÂY DỰNG BỘ KHUNG PEFT
+        # Hugging Face SAM3 exposes attention as q_proj/k_proj/v_proj/o_proj,
+        # while the MedSAM3 LoRA checkpoint can store attention as packed qkv
+        # plus proj. Target the HF module names and unpack qkv below.
         config = LoraConfig(
             r=r,
-            lora_alpha=r, 
-            target_modules=["qkv", "proj", "fc1", "fc2"],
+            lora_alpha=r,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "fc1", "fc2"],
             bias="none"
         )
         peft_encoder = get_peft_model(base_encoder, config)
@@ -371,6 +467,42 @@ class MedSAM_VisionEncoder(nn.Module):
         skipped_count = 0
         ckpt_module_counter = Counter()
         matched_module_counter = Counter()
+        qkv_by_block = {}
+
+        def _find_peft_key(block_idx, target_module, lora_type):
+            suffix = f".{target_module}.lora_{lora_type[-1]}.default.weight"
+            candidates = [
+                k for k in peft_dict.keys()
+                if re.search(rf"(layers|blocks)\.{block_idx}\.", k) and k.endswith(suffix)
+            ]
+            return candidates[0] if len(candidates) == 1 else None
+
+        def _fit_tensor(src_tensor, dst_tensor):
+            if src_tensor.shape == dst_tensor.shape:
+                return src_tensor
+            if src_tensor.ndim == 2 and src_tensor.t().shape == dst_tensor.shape:
+                return src_tensor.t().contiguous()
+            return None
+
+        def _chunk_qkv_b(src_tensor, dst_tensor, qkv_index):
+            if src_tensor.ndim != 2 or dst_tensor.ndim != 2:
+                return None
+            out_dim, rank_dim = dst_tensor.shape
+            if src_tensor.shape == (out_dim * 3, rank_dim):
+                return src_tensor.chunk(3, dim=0)[qkv_index].contiguous()
+            if src_tensor.shape == (rank_dim, out_dim * 3):
+                return src_tensor.t().contiguous().chunk(3, dim=0)[qkv_index].contiguous()
+            return _fit_tensor(src_tensor, dst_tensor)
+
+        def _map_direct(block_idx, target_module, lora_type, weight_tensor):
+            target_peft_key = _find_peft_key(block_idx, target_module, lora_type)
+            if target_peft_key is None:
+                return False
+            fitted = _fit_tensor(weight_tensor, peft_dict[target_peft_key])
+            if fitted is None:
+                return False
+            mapped_state_dict[target_peft_key] = fitted
+            return True
 
         for ckpt_key, weight_tensor in state_dict.items():
             if not torch.is_tensor(weight_tensor):
@@ -382,39 +514,54 @@ class MedSAM_VisionEncoder(nn.Module):
                 clean_key = clean_key[len("module."):]
 
             # Bước lọc 1: Regex bắt đúng 3 thông tin quan trọng
-            match = re.search(r'blocks\.(\d+).*?(qkv|proj|fc1|fc2).*?(lora_[AB])', clean_key)
+            match = re.search(
+                r'(?:^|\.)blocks\.(\d+).*?(qkv|q_proj|k_proj|v_proj|o_proj|proj|fc1|fc2).*?(lora_[AB])',
+                clean_key,
+            )
             if not match:
                 skipped_count += 1
                 continue # Bỏ qua ngay lập tức các key rác
                 
             block_idx, target_module, lora_type = match.groups()
             ckpt_module_counter[target_module] += 1
-            
-            # Bước lọc 2: Tìm "ổ cắm" tương ứng bên cấu trúc chuẩn của Hugging Face
-            peft_match_keys = [
-                k for k in peft_dict.keys()
-                if re.search(rf"(layers|blocks)\.{block_idx}\.", k) and target_module in k and lora_type in k
-            ]
-            
-            # Bước lọc 3: Khớp nối và cân chỉnh kích thước
-            if len(peft_match_keys) == 1:
-                target_peft_key = peft_match_keys[0]
-                target_peft_weight = peft_dict[target_peft_key]
-                
-                # Ép xoay chiều ma trận nếu kích thước không khớp
-                if weight_tensor.shape != target_peft_weight.shape:
-                    if weight_tensor.ndim == 2 and weight_tensor.t().shape == target_peft_weight.shape:
-                        weight_tensor = weight_tensor.t()
-                    else:
-                        print(f"Kích thước vẫn lệch cho {clean_key}. LoRA: {weight_tensor.shape}, Model: {target_peft_weight.shape}")
-                        skipped_count += 1
-                        continue # Bỏ qua chứ tuyệt đối không để crash!
-                        
-                mapped_state_dict[target_peft_key] = weight_tensor
+
+            if target_module == "qkv":
+                qkv_by_block.setdefault(block_idx, {})[lora_type] = weight_tensor
+                continue
+
+            target_module = "o_proj" if target_module == "proj" else target_module
+            if _map_direct(block_idx, target_module, lora_type, weight_tensor):
                 matched_count += 1
                 matched_module_counter[target_module] += 1
             else:
                 skipped_count += 1
+
+        for block_idx, qkv_parts in qkv_by_block.items():
+            qkv_a = qkv_parts.get("lora_A")
+            qkv_b = qkv_parts.get("lora_B")
+            if qkv_a is None or qkv_b is None:
+                skipped_count += len(qkv_parts)
+                continue
+            block_ok = True
+            for qkv_index, target_module in enumerate(("q_proj", "k_proj", "v_proj")):
+                key_a = _find_peft_key(block_idx, target_module, "lora_A")
+                key_b = _find_peft_key(block_idx, target_module, "lora_B")
+                if key_a is None or key_b is None:
+                    block_ok = False
+                    continue
+                if key_a in mapped_state_dict or key_b in mapped_state_dict:
+                    continue
+                fitted_a = _fit_tensor(qkv_a, peft_dict[key_a])
+                fitted_b = _chunk_qkv_b(qkv_b, peft_dict[key_b], qkv_index)
+                if fitted_a is None or fitted_b is None:
+                    block_ok = False
+                    continue
+                mapped_state_dict[key_a] = fitted_a
+                mapped_state_dict[key_b] = fitted_b
+                matched_count += 2
+                matched_module_counter[target_module] += 2
+            if not block_ok:
+                skipped_count += 2
 
         # 4. BƠM TRỌNG SỐ VÀO MÔ HÌNH
         peft_encoder.load_state_dict(mapped_state_dict, strict=False)
@@ -423,14 +570,38 @@ class MedSAM_VisionEncoder(nn.Module):
         print(f"✅ Hoàn tất Smart Matching: Đã ghép {matched_count} khối LoRA (Bỏ qua {skipped_count} keys không tương thích).")
 
         print("LoRA coverage theo module checkpoint:")
-        for mod_name in ["qkv", "proj", "fc1", "fc2"]:
+        for mod_name in ["qkv", "proj", "q_proj", "k_proj", "v_proj", "o_proj", "fc1", "fc2"]:
             ckpt_n = ckpt_module_counter.get(mod_name, 0)
             matched_n = matched_module_counter.get(mod_name, 0)
             if ckpt_n > 0:
                 print(f" - {mod_name}: matched {matched_n}/{ckpt_n}")
+        if ckpt_module_counter.get("qkv", 0) > 0:
+            unpacked_qkv = (
+                matched_module_counter.get("q_proj", 0)
+                + matched_module_counter.get("k_proj", 0)
+                + matched_module_counter.get("v_proj", 0)
+            )
+            print(f" - qkv unpacked to q/k/v: matched {unpacked_qkv}/{ckpt_module_counter.get('qkv', 0) * 3}")
+        if ckpt_module_counter.get("proj", 0) > 0:
+            print(
+                " - proj mapped to o_proj:",
+                f"matched {matched_module_counter.get('o_proj', 0)}/{ckpt_module_counter.get('proj', 0)}",
+            )
 
-        attn_ckpt = ckpt_module_counter.get("qkv", 0) + ckpt_module_counter.get("proj", 0)
-        attn_matched = matched_module_counter.get("qkv", 0) + matched_module_counter.get("proj", 0)
+        attn_ckpt = (
+            ckpt_module_counter.get("qkv", 0)
+            + ckpt_module_counter.get("proj", 0)
+            + ckpt_module_counter.get("q_proj", 0)
+            + ckpt_module_counter.get("k_proj", 0)
+            + ckpt_module_counter.get("v_proj", 0)
+            + ckpt_module_counter.get("o_proj", 0)
+        )
+        attn_matched = (
+            matched_module_counter.get("q_proj", 0)
+            + matched_module_counter.get("k_proj", 0)
+            + matched_module_counter.get("v_proj", 0)
+            + matched_module_counter.get("o_proj", 0)
+        )
         if attn_ckpt > 0 and attn_matched == 0:
             print("⚠️ CẢNH BÁO: Checkpoint có LoRA attention (qkv/proj) nhưng model hiện tại không map được.")
             print("⚠️ Khả năng cao checkpoint LoRA không tương thích hoàn toàn với backbone Sam3Model hiện tại.")
@@ -565,18 +736,25 @@ class MedSAM_VisionEncoder(nn.Module):
             encoder_outputs = self.image_encoder(images)
             image_embeddings = encoder_outputs.last_hidden_state
         
-        # 3. Tính Global Feature (Bằng cách lấy trung bình tất cả các token)
-        # Lấy trung bình theo chiều dim=1 (chiều Sequence_Length)
-        pooled_feat = image_embeddings.mean(dim=1) 
+        # 3. Tính Global Feature. Default vẫn là mean-pool để tương thích checkpoint cũ;
+        # các pooling mới cho phép model nhấn vào token/region nổi bật hơn khi fine-tune.
+        pooled_feat = self._pool_global_features(image_embeddings)
         global_feat = self.global_proj(pooled_feat) # Shape: [B, embed_dim]
+        if self.global_head is not None:
+            global_feat = global_feat + self.global_head(global_feat)
         
         # Đưa qua classifier để ra kết quả phân loại đa nhãn bệnh (Logits)
         global_logits = self.classifier(global_feat) # Shape: [B, num_global_disease_labels]
 
-        # Đầu ra đa nhãn entity trên cùng không gian đặc trưng global.
-        entity_logits = self.entity_classifier(global_feat) # Shape: [B, num_entity_labels]
-        entity_finding_logits = entity_logits[:, :self.num_entity_finding_labels]
-        entity_anatomy_logits = entity_logits[:, self.num_entity_finding_labels:]
+        entity_feat = global_feat
+        if self.entity_pool_proj is not None:
+            max_feat = image_embeddings.max(dim=1).values
+            entity_feat = self.entity_pool_proj(torch.cat([pooled_feat, max_feat], dim=-1))
+
+        # Đầu ra đa nhãn entity mặc định từ đặc trưng image-level riêng cho entity.
+        entity_global_logits = self.entity_classifier(entity_feat) # Shape: [B, num_entity_labels]
+        entity_logits = entity_global_logits
+        entity_local_logits = None
         
         local_feats = None
         prompt_embeddings = None
@@ -588,6 +766,19 @@ class MedSAM_VisionEncoder(nn.Module):
             # Vì ảnh đã là chuỗi token [B, 5184, 768], ta đưa thẳng vào local_proj luôn!
             # Không cần reshape hay permute lằng nhằng như code cũ nữa.
             local_feats = self.local_proj(image_embeddings) # Shape: [B, 5184, embed_dim]
+
+            if self.entity_patch_classifier is not None:
+                patch_entity_logits = self.entity_patch_classifier(local_feats)
+                topk = min(16, patch_entity_logits.shape[1])
+                entity_local_logits = patch_entity_logits.topk(topk, dim=1).values.mean(dim=1)
+                if self.local_entity_merge == "anatomy" and self.num_entity_anatomy_labels > 0:
+                    entity_logits = entity_global_logits.clone()
+                    anatomy_start = self.num_entity_finding_labels
+                    entity_logits[:, anatomy_start:] = 0.5 * (
+                        entity_global_logits[:, anatomy_start:] + entity_local_logits[:, anatomy_start:]
+                    )
+                else:
+                    entity_logits = 0.5 * (entity_global_logits + entity_local_logits)
 
             # 5. Text-guided Entity Extraction (Giữ nguyên)
             if self.use_text_guidance and local_prompts is not None:
@@ -609,13 +800,19 @@ class MedSAM_VisionEncoder(nn.Module):
                 # Loại bỏ embedding của prompt padding để tránh nhiễu downstream
                 concept_features = concept_features * prompt_mask.unsqueeze(-1).type_as(concept_features)
 
+        entity_finding_logits = entity_logits[:, :self.num_entity_finding_labels]
+        entity_anatomy_logits = entity_logits[:, self.num_entity_finding_labels:]
+
         return {
             "image_embeddings": image_embeddings, # Giữ lại nếu cần cho Prompt Encoder của SAM
             "global_features": global_feat,       # Đưa vào classifier 14 nhãn
             "global_logits": global_logits,
             "entity_logits": entity_logits,                       # (B, num_entity_labels)
             "entity_finding_logits": entity_finding_logits,       # (B, num_entity_finding_labels)
-            "entity_anatomy_logits": entity_anatomy_logits,       # (B, 29)
+            "entity_anatomy_logits": entity_anatomy_logits,       # (B, num_entity_anatomy_labels)
+            "entity_global_logits": entity_global_logits,
+            "entity_local_logits": entity_local_logits,
+            "entity_features": entity_feat,
             # Backward-compatible alias.
             "entity_disease_logits": entity_finding_logits,
             "local_features": local_feats,        # (B, 4096, embed_dim) -> Đưa vào GNN
