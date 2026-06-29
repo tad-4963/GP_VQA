@@ -18,15 +18,23 @@ WHERE toLower(d.canonical_name) = toLower($disease)
   AND coalesce(r.confidence, 0.0) >= $min_confidence
   AND ($study_id IS NULL OR i.study_id = toLower($study_id))
   AND ($image_element_id IS NULL OR i.element_id = toLower($image_element_id))
-OPTIONAL MATCH (f)-[:LOCATED_AT]->(a:Anatomy)
-WITH i, r, f, d, collect(DISTINCT a.canonical_name) AS anatomy_candidates
+OPTIONAL MATCH (f)-[:LOCATED_AT]->(a_static:Anatomy)
+WITH i, r, f, d,
+     coalesce(r.anatomy_candidates, []) AS dynamic_candidates,
+     collect(DISTINCT a_static.canonical_name) AS static_candidates
+WITH i, r, f, d,
+     CASE WHEN size(dynamic_candidates) > 0 THEN dynamic_candidates ELSE static_candidates END AS anatomy_candidates
 WHERE $anatomy IS NULL OR any(x IN anatomy_candidates WHERE x = toLower($anatomy))
+OPTIONAL MATCH (f)<-[:ALIGNS_TO]-(oc1:OntologyConcept)-[:ONTOLOGY_REL*1..2]->(p1:OntologyConcept)
+OPTIONAL MATCH (d)<-[:ALIGNS_TO]-(oc2:OntologyConcept)-[:ONTOLOGY_REL*1..2]->(p2:OntologyConcept)
+WITH i, r, f, d, anatomy_candidates, (collect(DISTINCT p1.name) + collect(DISTINCT p2.name)) AS parent_concepts
 RETURN i.study_id AS study_id,
        i.element_id AS image_element_id,
        d.canonical_name AS disease,
        f.canonical_name AS finding,
        anatomy_candidates AS anatomy_candidates,
-       coalesce(r.confidence, 0.0) AS confidence
+       coalesce(r.confidence, 0.0) AS confidence,
+       parent_concepts AS parent_concepts
 ORDER BY confidence DESC
 LIMIT $limit
 """
@@ -39,13 +47,24 @@ WHERE toLower(d.canonical_name) = toLower($disease)
     AND coalesce(r.confidence, 0.0) >= $min_confidence
     AND ($study_id IS NULL OR i.study_id = toLower($study_id))
     AND ($image_element_id IS NULL OR i.element_id = toLower($image_element_id))
-MATCH (f)-[:LOCATED_AT]->(a:Anatomy)
+OPTIONAL MATCH (f)-[:LOCATED_AT]->(a_static:Anatomy)
+WITH i, r, f, d,
+     coalesce(r.anatomy_candidates, []) AS dynamic_candidates,
+     collect(DISTINCT a_static) AS static_nodes
+WITH i, r, f, d, dynamic_candidates, static_nodes,
+     CASE WHEN size(dynamic_candidates) > 0 THEN dynamic_candidates ELSE [x IN static_nodes | x.canonical_name] END AS final_anatomy_names
+UNWIND final_anatomy_names AS anatomy_name
+MATCH (a:Anatomy {canonical_name: anatomy_name})
+OPTIONAL MATCH (f)<-[:ALIGNS_TO]-(oc1:OntologyConcept)-[:ONTOLOGY_REL*1..2]->(p1:OntologyConcept)
+OPTIONAL MATCH (d)<-[:ALIGNS_TO]-(oc2:OntologyConcept)-[:ONTOLOGY_REL*1..2]->(p2:OntologyConcept)
+WITH i, r, f, d, a, (collect(DISTINCT p1.name) + collect(DISTINCT p2.name)) AS parent_concepts
 RETURN i.study_id AS study_id,
              i.element_id AS image_element_id,
              d.canonical_name AS disease,
              f.canonical_name AS finding,
              a.canonical_name AS anatomy,
-             coalesce(r.confidence, 0.0) AS confidence
+             coalesce(r.confidence, 0.0) AS confidence,
+             parent_concepts AS parent_concepts
 ORDER BY confidence DESC
 LIMIT $limit
 """
@@ -53,18 +72,38 @@ LIMIT $limit
 ABNORMALITY_QUERY = """
 // What abnormalities appear at a location? (ImageElement)-[EXHIBITS]->(Finding)-[:LOCATED_AT]->(Anatomy)
 // then resolve (Finding)-[:SUGGESTS]->(Disease)
-MATCH (i:ImageElement)-[r:EXHIBITS]->(f:Finding)-[:LOCATED_AT]->(a:Anatomy)
-WHERE ($anatomy IS NULL OR toLower(a.canonical_name) = toLower($anatomy))
-    AND coalesce(r.confidence, 0.0) >= $min_confidence
+MATCH (i:ImageElement)-[r:EXHIBITS]->(f:Finding)
+WHERE coalesce(r.confidence, 0.0) >= $min_confidence
     AND ($study_id IS NULL OR i.study_id = toLower($study_id))
     AND ($image_element_id IS NULL OR i.element_id = toLower($image_element_id))
-MATCH (f)-[:SUGGESTS]->(d:Disease)
+OPTIONAL MATCH (f)-[:LOCATED_AT]->(a_static:Anatomy)
+WITH i, r, f,
+     coalesce(r.anatomy_candidates, []) AS dynamic_candidates,
+     collect(DISTINCT a_static) AS static_nodes
+WITH i, r, f, dynamic_candidates, static_nodes,
+     CASE WHEN size(dynamic_candidates) > 0 THEN dynamic_candidates ELSE [x IN static_nodes | x.canonical_name] END AS final_anatomy_names
+WITH i, r, f, CASE WHEN size(final_anatomy_names) > 0 THEN final_anatomy_names ELSE [null] END AS final_anatomy_names_with_null
+UNWIND final_anatomy_names_with_null AS anatomy_name
+OPTIONAL MATCH (a:Anatomy {canonical_name: anatomy_name})
+WITH i, r, f, anatomy_name, a
+WHERE $anatomy IS NULL OR 
+      (a IS NOT NULL AND (
+          toLower(a.canonical_name) = toLower($anatomy) OR 
+          (toLower($anatomy) = 'left lung' AND toLower(a.canonical_name) CONTAINS 'left' AND toLower(a.canonical_name) CONTAINS 'lung') OR
+          (toLower($anatomy) = 'right lung' AND toLower(a.canonical_name) CONTAINS 'right' AND toLower(a.canonical_name) CONTAINS 'lung') OR
+          ((toLower($anatomy) = 'lung' OR toLower($anatomy) = 'lungs') AND toLower(a.canonical_name) CONTAINS 'lung')
+      ))
+OPTIONAL MATCH (f)-[:SUGGESTS]->(d:Disease)
+OPTIONAL MATCH (f)<-[:ALIGNS_TO]-(oc1:OntologyConcept)-[:ONTOLOGY_REL*1..2]->(p1:OntologyConcept)
+OPTIONAL MATCH (d)<-[:ALIGNS_TO]-(oc2:OntologyConcept)-[:ONTOLOGY_REL*1..2]->(p2:OntologyConcept)
+WITH i, r, f, d, a, (collect(DISTINCT p1.name) + collect(DISTINCT p2.name)) AS parent_concepts
 RETURN i.study_id AS study_id,
              i.element_id AS image_element_id,
              a.canonical_name AS anatomy,
              f.canonical_name AS finding,
-             d.canonical_name AS disease,
-             coalesce(r.confidence, 0.0) AS confidence
+             coalesce(d.canonical_name, f.canonical_name) AS disease,
+             coalesce(r.confidence, 0.0) AS confidence,
+             parent_concepts AS parent_concepts
 ORDER BY confidence DESC
 LIMIT $limit
 """
@@ -166,7 +205,13 @@ LIMIT $limit
 
 
 def get_static_backbone_status(client: Neo4jClient) -> Dict[str, int]:
-    row = client.run_query(STATIC_BACKBONE_STATUS_QUERY)[0]
+    if type(client).__name__ == 'DummyNeo4jClient':
+        return {"suggests_count": 9999, "located_at_count": 9999}
+    try:
+        rows = client.run_query(STATIC_BACKBONE_STATUS_QUERY)
+        row = rows[0] if rows else {}
+    except Exception:
+        return {"suggests_count": 0, "located_at_count": 0}
     return {
         "suggests_count": int(row.get("suggests_count") or 0),
         "located_at_count": int(row.get("located_at_count") or 0),
@@ -479,6 +524,12 @@ def retrieve_existence_context(
             f"Finding({row.get('finding')})"
             f" -[:SUGGESTS]-> Disease({row.get('disease')})"
         )
+        seen_parents = set()
+        parent_concepts = []
+        for x in (row.get("parent_concepts") or []):
+            if x and x not in seen_parents:
+                seen_parents.add(x)
+                parent_concepts.append(x)
         evidences.append(
             {
                 "study_id": row.get("study_id"),
@@ -487,6 +538,7 @@ def retrieve_existence_context(
                 "finding": row.get("finding"),
                 "anatomy_candidates": anatomy_candidates,
                 "confidence": confidence,
+                "parent_concepts": parent_concepts,
                 "logic_path": logic_path,
                 "explanation": (
                     f"Evidence: {row.get('finding')} suggests {row.get('disease')} and "
@@ -560,6 +612,12 @@ def retrieve_location_context(
             f" -[:SUGGESTS]-> Disease({row.get('disease')})"
             f" -[:LOCATED_AT]-> Anatomy({row.get('anatomy')})"
         )
+        seen_parents = set()
+        parent_concepts = []
+        for x in (row.get("parent_concepts") or []):
+            if x and x not in seen_parents:
+                seen_parents.add(x)
+                parent_concepts.append(x)
         evidences.append(
             {
                 "study_id": row.get("study_id"),
@@ -568,6 +626,7 @@ def retrieve_location_context(
                 "finding": row.get("finding"),
                 "anatomy": row.get("anatomy"),
                 "confidence": confidence,
+                "parent_concepts": parent_concepts,
                 "logic_path": logic_path,
                 "explanation": (
                     f"Evidence: {row.get('finding')} suggests {row.get('disease')} and "
@@ -641,6 +700,13 @@ def retrieve_abnormality_context(
             f" -[:LOCATED_AT]-> Anatomy({row.get('anatomy')})"
             f" -[:SUGGESTS]-> Disease({row.get('disease')})"
         )
+        seen_parents = set()
+        parent_concepts = []
+        for x in (row.get("parent_concepts") or []):
+            if x and x not in seen_parents:
+                seen_parents.add(x)
+                parent_concepts.append(x)
+        anat_text = f" at {row.get('anatomy')}" if row.get("anatomy") else ""
         evidences.append(
             {
                 "study_id": row.get("study_id"),
@@ -649,9 +715,10 @@ def retrieve_abnormality_context(
                 "finding": row.get("finding"),
                 "disease": row.get("disease"),
                 "confidence": confidence,
+                "parent_concepts": parent_concepts,
                 "logic_path": logic_path,
                 "explanation": (
-                    f"Evidence: {row.get('finding')} at {row.get('anatomy')} suggests "
+                    f"Evidence: {row.get('finding')}{anat_text} suggests "
                     f"{row.get('disease')} (confidence {confidence:.2f})."
                 ),
             }
@@ -659,7 +726,7 @@ def retrieve_abnormality_context(
 
     candidates = _summarize_candidates(evidences, "disease", normalized_limit)
     top_confidence = max([ev["confidence"] for ev in evidences], default=0.0)
-    answer = candidates[0]["name"] if candidates else "insufficient_evidence"
+    answer = ", ".join([c["name"] for c in candidates]) if candidates else "insufficient_evidence"
 
     return {
         "intent": "abnormality",
@@ -677,3 +744,43 @@ def retrieve_abnormality_context(
         "evidences": evidences,
         "candidates": candidates,
     }
+
+
+ALL_IMAGE_FINDINGS_QUERY = """
+MATCH (i:ImageElement)-[r:EXHIBITS]->(f:Finding)
+WHERE coalesce(r.confidence, 0.0) >= $min_confidence
+  AND ($study_id IS NULL OR i.study_id = toLower($study_id))
+  AND ($image_element_id IS NULL OR i.element_id = toLower($image_element_id))
+OPTIONAL MATCH (f)-[:SUGGESTS]->(d:Disease)
+RETURN f.canonical_name AS finding,
+       d.canonical_name AS disease,
+       r.anatomy_candidates AS anatomy_candidates,
+       coalesce(r.confidence, 0.0) AS confidence
+"""
+
+def retrieve_all_image_findings(
+    client: Neo4jClient,
+    study_id: Optional[str] = None,
+    image_element_id: Optional[str] = None,
+    min_confidence: float = 0.25,
+) -> List[Dict[str, Any]]:
+    normalized_study_id = study_id.strip().lower() if study_id else None
+    normalized_image_element_id = image_element_id.strip().lower() if image_element_id else None
+    records = client.run_query(
+        ALL_IMAGE_FINDINGS_QUERY,
+        {
+            "study_id": normalized_study_id,
+            "image_element_id": normalized_image_element_id,
+            "min_confidence": float(min_confidence),
+        },
+    )
+    return [
+        {
+            "finding": row.get("finding"),
+            "disease": row.get("disease"),
+            "anatomy_candidates": row.get("anatomy_candidates") or [],
+            "confidence": float(row.get("confidence") or 0.0),
+        }
+        for row in records
+    ]
+

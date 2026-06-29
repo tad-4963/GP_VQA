@@ -17,9 +17,10 @@ class LLMAnswer:
 class KGContextPromptBuilder:
     """Builds a compact, evidence-grounded prompt for answer generation."""
 
-    def __init__(self, max_evidences: int = 5, max_candidates: int = 5):
+    def __init__(self, max_evidences: int = 5, max_candidates: int = 5, language: str = "vi"):
         self.max_evidences = max(1, int(max_evidences))
         self.max_candidates = max(1, int(max_candidates))
+        self.language = str(language).lower()
 
     def build_messages(
         self,
@@ -36,22 +37,53 @@ class KGContextPromptBuilder:
             },
             "kg_context": self._compact_context(kg_context),
         }
+
+        language_instruction = ""
+        if self.language == "vi":
+            language_instruction = (
+                " IMPORTANT: You MUST generate the 'answer' and 'explanation' in Vietnamese (Tiếng Việt). "
+                "The 'answer' must be a concise string (e.g. 'có', 'không', or the name of the abnormality/location in Vietnamese). "
+                "The 'explanation' MUST be written in a natural, professional, and empathetic clinical Vietnamese tone, exactly like a senior radiologist. "
+                "Translate medical terms to standard Vietnamese: 'pneumonia' -> 'viêm phổi', 'pleural effusion' -> 'tràn dịch màng phổi', "
+                "'cardiomegaly' -> 'bóng tim to/phì đại tim', 'fracture' -> 'gãy xương sườn/xương đòn', 'atelectasis' -> 'xẹp phổi', "
+                "'consolidation' -> 'đông đặc phổi', 'pulmonary edema' -> 'phù phổi', 'pneumothorax' -> 'tràn khí màng phổi', 'lung opacity' -> 'vùng mờ ở phổi'. "
+                "Do NOT use robotic translations like 'dựa trên bằng chứng đồ thị tri thức' or 'mức độ tin cậy là 0.55'. "
+                "You MUST specify the anatomy locations (observed_at) of the findings if available (e.g., 'đáy phổi', 'phổi phải', 'xương sườn'). "
+                "If evidence is insufficient, return 'insufficient_evidence' (do not translate this specific string for the 'answer' key). "
+                "If the diagnosis is ambiguous or evidence is insufficient, suggest specific next diagnostic steps (e.g. suggest sputum test or chest CT for pneumonia, suggest diagnostic pleural tap for pleural effusion, or recommend checking history of chest trauma/fall for fracture). "
+                "CRITICAL: If 'other_findings' are provided, you MUST explicitly list and warn about ALL of these secondary abnormalities at the end of the explanation in a structured way (e.g., 'Bên cạnh đó, hình ảnh còn ghi nhận các bất thường đi kèm bao gồm: [bất thường] ở [vị trí giải phẫu]...'), ensuring completeness of the radiologist report. "
+                "However, do NOT include secondary findings from 'other_findings' in the 'answer' key. The 'answer' must ONLY contain findings directly supported by the main 'evidences' list for the queried anatomy."
+            )
+        else:
+            language_instruction = (
+                " Return strict JSON with keys 'answer' and 'explanation' in English. "
+                "The 'answer' must be a concise string or a comma-separated list of findings/locations if there are multiple (e.g. 'yes', 'no', 'pneumothorax', 'right lung', or 'cardiomegaly, pleural effusion'). "
+                "The 'explanation' should be written in a natural, professional clinical tone, like a doctor explaining findings to a colleague or patient. "
+                "Do NOT use database-centric or robotic phrases like 'according to the provided knowledge graph evidence' or 'confidence level is 0.55'. "
+                "If the context is flagged as ambiguous (is_ambiguous: true) or if the evidence is insufficient, "
+                "you MUST proactively suggest one or more clinical follow-up questions in English, asking about "
+                "symptoms like chest pain, cough, or fever to help narrow down the diagnosis. "
+                "Additionally, if there are other findings/pathologies provided under 'other_findings', you MUST briefly warn or mention these secondary findings at the end of the explanation in English, focusing primarily on answering the user's question first. "
+                "CRITICAL: Do NOT include secondary findings from 'other_findings' in the 'answer' key. The 'answer' must ONLY contain findings directly supported by the main 'evidences' list for the queried anatomy. If the main 'evidences' list is empty, the 'answer' key MUST be 'insufficient_evidence'."
+            )
+
+
+
         return [
             {
                 "role": "system",
                 "content": (
-                    "You answer chest X-ray visual questions using only the supplied "
-                    "knowledge graph evidence and logic paths. Do not add findings, "
-                    "locations, or diagnoses that are absent from the evidence. If evidence is insufficient, answer exactly "
-                    "'insufficient_evidence'. Return strict JSON with keys "
-                    "'answer' and 'explanation'. The answer must be a concise string, "
-                    "not an array or nested object. The explanation should be 2-4 "
-                    "sentences and must explicitly cover: (1) what was observed on "
-                    "the image from the Finding/Anatomy evidence, (2) what disease "
-                    "or abnormality this supports from the Disease evidence, and "
-                    "(3) the confidence/evidence strength. Use the supplied logic_path "
-                    "values as the reasoning chain, but keep the wording concise. "
-                    "Briefly caveat that the response is based only on the provided KG evidence."
+                    "You are an expert radiologist and medical doctor. You answer chest X-ray visual questions using only the supplied "
+                    "knowledge graph evidence and logic paths. Do not invent entirely unrelated findings. "
+                    "If evidence is insufficient, answer exactly 'insufficient_evidence'. Return strict JSON with keys 'answer' and 'explanation'. "
+                    "The answer must be a concise string, not an array or nested object. "
+                    "The explanation should be 2-4 sentences and written in a natural, professional clinical tone. "
+                    "Instead of citing raw numerical confidence levels or database logic paths directly, describe what was observed "
+                    "and suspected diagnoses as a clinical narrative (e.g., describing findings at specific locations, suspected diseases, "
+                    "and qualitative clinical certainty like 'highly likely', 'suggestive', or 'moderate sign').\n\n"
+                    "MEDICAL REASONING RULES:\n"
+                    "1. If the question asks 'is there evidence of any abnormalities?' or asks if the image is normal/abnormal in general, and there are findings present, the 'answer' key MUST be exactly 'yes'. Do not list diseases in the 'answer' key for this specific question type.\n\n"
+                    + language_instruction
                 ),
             },
             {
@@ -66,8 +98,10 @@ class KGContextPromptBuilder:
             "answer": kg_context.get("answer"),
             "confidence": kg_context.get("confidence", 0.0),
             "evidence_count": kg_context.get("evidence_count", 0),
+            "is_ambiguous": bool(kg_context.get("is_ambiguous", False)),
             "evidences": self._compact_evidences(kg_context.get("evidences"), self.max_evidences),
             "candidates": self._compact_candidates(kg_context.get("candidates"), self.max_candidates),
+            "other_findings": self._compact_other_findings(kg_context.get("other_findings"), self.max_evidences),
             "query": kg_context.get("query") or {},
             "context_policy": kg_context.get("context_policy") or {},
         }
@@ -94,6 +128,7 @@ class KGContextPromptBuilder:
                     "anatomy_candidates": anatomy_candidates or [],
                     "diagnosis": evidence.get("disease") or evidence.get("answer"),
                     "confidence": evidence.get("confidence"),
+                    "parent_concepts": evidence.get("parent_concepts") or [],
                     "logic_path": evidence.get("logic_path", ""),
                     "kg_explanation": evidence.get("explanation", ""),
                 }
@@ -113,6 +148,22 @@ class KGContextPromptBuilder:
                     "diagnosis": candidate.get("disease") or candidate.get("answer"),
                     "confidence": candidate.get("confidence"),
                     "logic_path": candidate.get("logic_path", ""),
+                }
+            )
+        return compacted
+
+    def _compact_other_findings(self, values: Any, limit: int) -> List[Dict[str, Any]]:
+        findings = self._take(values, limit)
+        compacted = []
+        for f in findings:
+            if not isinstance(f, Mapping):
+                continue
+            compacted.append(
+                {
+                    "finding": f.get("finding"),
+                    "observed_at": f.get("anatomy_candidates") or [],
+                    "confidence": f.get("confidence"),
+                    "diagnosis": f.get("disease"),
                 }
             )
         return compacted
@@ -145,7 +196,12 @@ class QuestionRoutingPromptBuilder:
                     "image_element_id should be copied from the question when present, otherwise null. "
                     "ingest_date must be YYYY-MM-DD when the user gives a date, asks for today, yesterday, "
                     "or a relative date based on current_date; otherwise null. aggregate is true for count/statistics. "
-                    "Do not invent diseases, ids, or dates that are not present or implied by the question."
+                    "Do not invent diseases, ids, or dates that are not present or implied by the question. "
+                    "CRITICAL: The input question may be in Vietnamese. You MUST translate any extracted diseases, "
+                    "findings, and anatomies into their canonical English medical terms (e.g. 'viêm phổi' or 'phổi bị viêm' -> 'pneumonia', "
+                    "'phổi phải' -> 'right lung', 'tràn dịch màng phổi' -> 'pleural effusion', 'bóng tim to' -> 'cardiomegaly') "
+                    "so they match the English knowledge graph. All list elements must be in English. "
+                    "The explanation should be in the same language as the user's question."
                 ),
             },
             {
@@ -173,6 +229,7 @@ class OpenAICompatibleAnswerGenerator:
         temperature: float = 0.0,
         max_tokens: int = 256,
         prompt_builder: Optional[KGContextPromptBuilder] = None,
+        language: str = "vi",
     ):
         self.model = model
         self.api_key = api_key if api_key is not None else os.getenv("OPENAI_API_KEY")
@@ -180,7 +237,8 @@ class OpenAICompatibleAnswerGenerator:
         self.timeout = float(timeout)
         self.temperature = float(temperature)
         self.max_tokens = int(max_tokens)
-        self.prompt_builder = prompt_builder or KGContextPromptBuilder()
+        self.language = language
+        self.prompt_builder = prompt_builder or KGContextPromptBuilder(language=language)
 
     @classmethod
     def from_env(cls) -> "OpenAICompatibleAnswerGenerator":
@@ -194,6 +252,7 @@ class OpenAICompatibleAnswerGenerator:
             timeout=float(os.getenv("VQA_LLM_TIMEOUT", "30")),
             temperature=float(os.getenv("VQA_LLM_TEMPERATURE", "0")),
             max_tokens=int(os.getenv("VQA_LLM_MAX_TOKENS", "256")),
+            language=os.getenv("VQA_LLM_LANGUAGE", "vi"),
         )
 
     def generate(
